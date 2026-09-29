@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { createWorker } from 'tesseract.js';
 import { 
   ShoppingCart, Package, ArrowLeftRight, Barcode, Camera, 
   Search, Plus, Trash2, Edit, Check, AlertTriangle, RefreshCw, 
@@ -100,6 +101,11 @@ export default function BaqalatiApp() {
   const [capturedImage, setCapturedImage] = useState(null);
   const [isAnalyzingImage, setIsAnalyzingImage] = useState(false);
   const [aiDetectedData, setAiDetectedData] = useState(null);
+  const [cameraError, setCameraError] = useState('');
+  const [recognitionError, setRecognitionError] = useState('');
+  const videoRef = useRef(null);
+  const cameraStreamRef = useRef(null);
+  const photoInputRef = useRef(null);
 
   // New Product Form State
   const [productForm, setProductForm] = useState({
@@ -138,6 +144,54 @@ export default function BaqalatiApp() {
   useEffect(() => {
     localStorage.setItem('baqalati_curr', currency);
   }, [currency]);
+
+  useEffect(() => {
+    if (!showPhotoModal || capturedImage) return undefined;
+
+    let cancelled = false;
+    const videoElement = videoRef.current;
+    const startCamera = async () => {
+      try {
+        if (!navigator.mediaDevices?.getUserMedia) {
+          throw new Error('camera_unavailable');
+        }
+
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 } }
+        });
+
+        if (cancelled) {
+          stream.getTracks().forEach(track => track.stop());
+          return;
+        }
+
+        cameraStreamRef.current = stream;
+        if (videoElement) {
+          videoElement.srcObject = stream;
+          await videoElement.play();
+        }
+        setCameraError('');
+      } catch (error) {
+        if (cancelled) return;
+        if (error.name === 'NotAllowedError' || error.name === 'SecurityError') {
+          setCameraError('لم يُسمح باستخدام الكاميرا. فعّل إذن الكاميرا أو اختر صورة من الجهاز.');
+        } else if (error.name === 'NotFoundError' || error.message === 'camera_unavailable') {
+          setCameraError('لم يتم العثور على كاميرا متاحة. يمكنك اختيار صورة من الجهاز.');
+        } else {
+          setCameraError('تعذر تشغيل الكاميرا. تحقق من اتصال آمن وإذن الكاميرا، أو اختر صورة.');
+        }
+      }
+    };
+
+    startCamera();
+    return () => {
+      cancelled = true;
+      cameraStreamRef.current?.getTracks().forEach(track => track.stop());
+      cameraStreamRef.current = null;
+      if (videoElement) videoElement.srcObject = null;
+    };
+  }, [showPhotoModal, capturedImage]);
 
   // --- HELPER FUNCTIONS ---
   const playBeep = () => {
@@ -293,38 +347,78 @@ export default function BaqalatiApp() {
     setPackagingData({ bulkProductId: '', retailProductId: '', unitsCount: 1, unitSize: 1, notes: '' });
   };
 
-  // --- SMART PHOTO & AI SIMULATION ---
-  const handleSimulateCapture = () => {
-    // Simulated camera capture sample
-    const sampleImage = 'https://images.unsplash.com/photo-1584308666744-24d5c474f2ae?w=400&auto=format&fit=crop&q=60';
-    setCapturedImage(sampleImage);
+  // --- PRODUCT PHOTO OCR ---
+  const analyzeProductImage = async (image) => {
     setIsAnalyzingImage(true);
+    setAiDetectedData(null);
+    setRecognitionError('');
 
-    // Simulate AI Identification delay
-    setTimeout(() => {
-      setIsAnalyzingImage(false);
+    let worker;
+    try {
+      worker = await createWorker('ara+eng');
+      const { data } = await worker.recognize(image);
+      const recognizedText = data.text.trim();
+      const suggestedName = recognizedText
+        .split(/\r?\n/)
+        .map(line => line.trim())
+        .find(line => /[A-Za-z\u0600-\u06FF]{3,}/.test(line));
+
+      if (!suggestedName) {
+        setRecognitionError('لم يظهر نص واضح على العبوة. جرّب صورة أقرب وبإضاءة أفضل، أو أدخل الاسم يدوياً.');
+        return;
+      }
+
       setAiDetectedData({
-        suggestedName: 'عصير برتقال طبيعي 1 لتر',
-        suggestedCategory: 'مشروبات وعصائر',
-        suggestedUnit: 'عبوة',
-        suggestedPrice: 1500,
-        suggestedCost: 1200,
-        confidence: '94%'
+        suggestedName,
+        recognizedText,
+        confidence: Math.round(data.confidence)
       });
-    }, 1500);
+    } catch {
+      setRecognitionError('تعذرت قراءة النص. تحقق من اتصال الإنترنت ثم جرّب صورة أوضح.');
+    } finally {
+      if (worker) await worker.terminate();
+      setIsAnalyzingImage(false);
+    }
+  };
+
+  const captureProductPhoto = () => {
+    const video = videoRef.current;
+    if (!video || !video.videoWidth) {
+      setCameraError('انتظر حتى تظهر صورة الكاميرا ثم التقط الصورة.');
+      return;
+    }
+
+    const canvas = document.createElement('canvas');
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
+    const image = canvas.toDataURL('image/jpeg', 0.9);
+    setCapturedImage(image);
+    analyzeProductImage(image);
+  };
+
+  const handlePhotoFile = (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = () => {
+      const image = String(reader.result);
+      setCapturedImage(image);
+      analyzeProductImage(image);
+    };
+    reader.onerror = () => setRecognitionError('تعذر فتح الصورة المحددة. جرّب ملف صورة آخر.');
+    reader.readAsDataURL(file);
+    event.target.value = '';
   };
 
   const applyAiSuggestions = () => {
     if (!aiDetectedData) return;
-    setProductForm({
-      ...productForm,
+    setProductForm(current => ({
+      ...current,
       name: aiDetectedData.suggestedName,
-      category: aiDetectedData.suggestedCategory,
-      unit: aiDetectedData.suggestedUnit,
-      purchasePrice: aiDetectedData.suggestedCost,
-      salePrice: aiDetectedData.suggestedPrice,
       image: capturedImage
-    });
+    }));
     setShowPhotoModal(false);
     setShowProductModal(true);
   };
@@ -427,7 +521,13 @@ export default function BaqalatiApp() {
                   />
                 </div>
                 <button 
-                  onClick={() => setShowPhotoModal(true)}
+                  onClick={() => {
+                    setCapturedImage(null);
+                    setAiDetectedData(null);
+                    setCameraError('');
+                    setRecognitionError('');
+                    setShowPhotoModal(true);
+                  }}
                   className="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2.5 rounded-lg flex items-center gap-2 text-sm font-semibold transition"
                   title="التقاط صورة للتعرف على المنتج"
                 >
@@ -441,10 +541,12 @@ export default function BaqalatiApp() {
                 {products
                   .filter(p => p.name.includes(searchTerm) || p.barcode.includes(searchTerm))
                   .map(product => (
-                    <div 
+                    <button
+                      type="button"
                       key={product.id}
                       onClick={() => addToCart(product)}
-                      className="bg-white p-3 rounded-xl border border-slate-200 hover:border-emerald-500 shadow-sm cursor-pointer transition hover:shadow-md flex flex-col justify-between"
+                      aria-label={`إضافة ${product.name} إلى السلة`}
+                      className="w-full text-right bg-white p-3 rounded-xl border border-slate-200 hover:border-emerald-500 shadow-sm transition hover:shadow-md flex flex-col justify-between"
                     >
                       <div>
                         {product.image ? (
@@ -459,17 +561,17 @@ export default function BaqalatiApp() {
                       </div>
                       <div className="mt-3 flex items-center justify-between">
                         <span className="font-black text-emerald-600 text-base">{product.salePrice} {currency}</span>
-                        <button className="bg-emerald-100 text-emerald-700 p-1.5 rounded-lg hover:bg-emerald-200">
+                        <span aria-hidden="true" className="bg-emerald-100 text-emerald-700 p-1.5 rounded-lg">
                           <Plus className="w-4 h-4" />
-                        </button>
+                        </span>
                       </div>
-                    </div>
+                    </button>
                   ))}
               </div>
             </div>
 
             {/* CART SUMMARY */}
-            <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-200 flex flex-col justify-between h-[calc(100vh-200px)] sticky top-28">
+            <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-200 flex flex-col justify-between min-h-[360px] lg:h-[calc(100vh-200px)] lg:sticky lg:top-28">
               <div>
                 <div className="flex items-center justify-between pb-3 border-b border-slate-200">
                   <h2 className="font-bold text-lg text-slate-800 flex items-center gap-2">
@@ -943,55 +1045,101 @@ export default function BaqalatiApp() {
       {/* ==================== MODAL 3: SMART CAMERA PHOTO RECOGNITION ==================== */}
       {showPhotoModal && (
         <div className="fixed inset-0 bg-slate-900/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-          <div className="bg-white w-full max-w-lg rounded-2xl shadow-xl overflow-hidden">
+          <div role="dialog" aria-modal="true" aria-labelledby="photo-modal-title" className="bg-white w-full max-w-lg rounded-2xl shadow-xl overflow-hidden max-h-[95svh] flex flex-col">
             <div className="p-4 bg-indigo-900 text-white flex justify-between items-center">
               <h3 className="font-bold text-base flex items-center gap-2">
                 <Sparkles className="w-5 h-5 text-indigo-300" />
-                <span>التعرف الذكي على المنتج من الصورة</span>
+                <span id="photo-modal-title">تصوير المنتج وقراءة بيانات العبوة</span>
               </h3>
-              <button onClick={() => setShowPhotoModal(false)}><X className="w-5 h-5" /></button>
+              <button type="button" aria-label="إغلاق" onClick={() => setShowPhotoModal(false)}><X className="w-5 h-5" /></button>
             </div>
 
-            <div className="p-6 text-center space-y-4">
+            <div className="p-4 sm:p-6 text-center space-y-4 overflow-y-auto">
               {!capturedImage ? (
-                <div className="border-2 border-dashed border-slate-300 p-8 rounded-xl bg-slate-50 flex flex-col items-center justify-center">
-                  <Camera className="w-12 h-12 text-slate-400 mb-3" />
-                  <p className="text-sm font-semibold text-slate-600 mb-4">وجه كاميرا الهاتف نحو غلاف أو شكل المنتج</p>
-                  <button 
-                    onClick={handleSimulateCapture}
-                    className="bg-indigo-600 hover:bg-indigo-700 text-white font-bold px-6 py-2.5 rounded-lg text-sm"
-                  >
-                    التقاط صورة الآن
-                  </button>
+                <div className="space-y-3">
+                  <div className="relative aspect-[4/3] overflow-hidden rounded-xl bg-slate-950">
+                    <video
+                      ref={videoRef}
+                      autoPlay
+                      muted
+                      playsInline
+                      onCanPlay={() => setCameraError('')}
+                      className="h-full w-full object-cover"
+                    />
+                    <div className="pointer-events-none absolute inset-[12%] rounded-xl border-2 border-emerald-400 shadow-[0_0_0_999px_rgba(2,6,23,0.25)]" />
+                    <span className="pointer-events-none absolute bottom-3 inset-x-3 rounded bg-slate-950/70 px-3 py-1.5 text-xs text-white">
+                      ضع اسم المنتج والباركود داخل الإطار
+                    </span>
+                  </div>
+                  {cameraError && <p role="alert" className="text-sm text-red-700">{cameraError}</p>}
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={captureProductPhoto}
+                      disabled={Boolean(cameraError)}
+                      className="bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-300 text-white font-bold px-4 py-2.5 rounded-lg text-sm"
+                    >
+                      <Camera className="inline-block w-4 h-4 ml-2" />
+                      التقاط صورة
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => photoInputRef.current?.click()}
+                      className="bg-slate-100 hover:bg-slate-200 text-slate-800 font-bold px-4 py-2.5 rounded-lg text-sm"
+                    >
+                      اختيار صورة من الجهاز
+                    </button>
+                  </div>
+                  <input
+                    ref={photoInputRef}
+                    type="file"
+                    accept="image/*"
+                    capture="environment"
+                    onChange={handlePhotoFile}
+                    className="hidden"
+                  />
                 </div>
               ) : (
                 <div className="space-y-4">
-                  <img src={capturedImage} alt="التقاط المنتج" className="w-full h-48 object-cover rounded-xl shadow" />
+                  <img src={capturedImage} alt="صورة المنتج" className="w-full max-h-64 object-contain bg-slate-100 rounded-xl" />
 
                   {isAnalyzingImage ? (
                     <div className="flex items-center justify-center gap-2 text-indigo-600 py-4 font-bold">
                       <RefreshCw className="w-5 h-5 animate-spin" />
-                      <span>جاري تحليل الصورة والتعرف على المنتج...</span>
+                      <span>جاري قراءة النص من العبوة لأول مرة قد يستغرق ذلك بعض الوقت...</span>
                     </div>
                   ) : (
-                    aiDetectedData && (
+                    <>
+                      {recognitionError && <p role="alert" className="text-sm text-red-700">{recognitionError}</p>}
+                      {aiDetectedData && (
                       <div className="bg-indigo-50 border border-indigo-200 p-4 rounded-xl text-right space-y-2 text-sm">
                         <div className="flex justify-between items-center border-b border-indigo-100 pb-2">
-                          <span className="font-bold text-indigo-900">المنتج المقترح:</span>
-                          <span className="text-xs bg-indigo-200 text-indigo-800 px-2 py-0.5 rounded">دقة {aiDetectedData.confidence}</span>
+                          <span className="font-bold text-indigo-900">النص المقروء من العبوة:</span>
+                          <span className="text-xs bg-indigo-200 text-indigo-800 px-2 py-0.5 rounded">دقة OCR {aiDetectedData.confidence}%</span>
                         </div>
-                        <p><strong>الاسم:</strong> {aiDetectedData.suggestedName}</p>
-                        <p><strong>التصنيف:</strong> {aiDetectedData.suggestedCategory}</p>
-                        <p><strong>السعر المقترح:</strong> {aiDetectedData.suggestedPrice} {currency}</p>
+                        <p className="whitespace-pre-wrap break-words">{aiDetectedData.recognizedText}</p>
+                        <p className="text-xs text-slate-600">هذه قراءة للنص فقط؛ راجع الاسم وأدخل التصنيف والأسعار يدوياً.</p>
 
                         <button 
                           onClick={applyAiSuggestions}
                           className="w-full bg-emerald-500 hover:bg-emerald-600 text-slate-950 font-bold py-2.5 rounded-lg text-sm mt-3"
                         >
-                          اعتماد المقترح وتعبئة نموذج المنتج
+                          استخدام أول سطر كاسم للمنتج
                         </button>
                       </div>
-                    )
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setCapturedImage(null);
+                          setAiDetectedData(null);
+                          setRecognitionError('');
+                        }}
+                        className="w-full bg-slate-100 hover:bg-slate-200 text-slate-800 font-bold py-2.5 rounded-lg text-sm"
+                      >
+                        إعادة التصوير
+                      </button>
+                    </>
                   )}
                 </div>
               )}
